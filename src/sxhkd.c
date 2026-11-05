@@ -26,12 +26,14 @@
 #include <xcb/xkb.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
 #include "parse.h"
@@ -55,13 +57,20 @@ int timeout;
 char sxhkd_pid[MAXLEN];
 
 hotkey_t *hotkeys_head, *hotkeys_tail;
-bool running, grabbed, toggle_grab, reload, bell, chained, locked;
+volatile sig_atomic_t running, toggle_grab, reload, bell;
+bool grabbed, chained, locked;
+sigset_t orig_sigmask;
 xcb_keysym_t abort_keysym;
 chord_t *abort_chord;
 
 uint16_t num_lock;
 uint16_t caps_lock;
 uint16_t scroll_lock;
+
+#define USAGE "sxhkd [-h|-v|-m COUNT|-t TIMEOUT|-c CONFIG_FILE|-r REDIR_FILE|-s STATUS_FIFO|-a ABORT_KEYSYM] [EXTRA_CONFIG ...]\n"
+
+static void install_signal_handlers(void);
+static void free_hotkeys(hotkey_t *hk);
 
 int main(int argc, char *argv[])
 {
@@ -82,16 +91,22 @@ int main(int argc, char *argv[])
 				exit(EXIT_SUCCESS);
 				break;
 			case 'h':
-				printf("sxhkd [-h|-v|-m COUNT|-t TIMEOUT|-c CONFIG_FILE|-r REDIR_FILE|-s STATUS_FIFO|-a ABORT_KEYSYM] [EXTRA_CONFIG ...]\n");
+				printf(USAGE);
 				exit(EXIT_SUCCESS);
 				break;
 			case 'm':
 				if (sscanf(optarg, "%i", &mapping_count) != 1)
 					warn("Can't parse mapping count.\n");
 				break;
-			case 't':
-				timeout = atoi(optarg);
+			case 't': {
+				char *end;
+				long t = strtol(optarg, &end, 10);
+				if (end == optarg || *end != '\0')
+					warn("Can't parse timeout: %s.\n", optarg);
+				else
+					timeout = (int) t;
 				break;
+			}
 			case 'c':
 				config_path = optarg;
 				break;
@@ -108,45 +123,58 @@ int main(int argc, char *argv[])
 					warn("Invalid keysym name: %s.\n", optarg);
 				}
 				break;
+			default:
+				fprintf(stderr, USAGE);
+				exit(EXIT_FAILURE);
 		}
 	}
 
 	num_extra_confs = argc - optind;
 	extra_confs = argv + optind;
 
+	int len;
 	if (config_path == NULL) {
 		char *config_home = getenv(CONFIG_HOME_ENV);
-		if (config_home != NULL)
-			snprintf(config_file, sizeof(config_file), "%s/%s", config_home, CONFIG_PATH);
-		else
-			snprintf(config_file, sizeof(config_file), "%s/%s/%s", getenv("HOME"), ".config", CONFIG_PATH);
+		if (config_home != NULL && config_home[0] != '\0') {
+			len = snprintf(config_file, sizeof(config_file), "%s/%s", config_home, CONFIG_PATH);
+		} else {
+			char *home = getenv("HOME");
+			if (home == NULL)
+				err("Neither '%s' nor 'HOME' is defined.\n", CONFIG_HOME_ENV);
+			len = snprintf(config_file, sizeof(config_file), "%s/%s/%s", home, ".config", CONFIG_PATH);
+		}
 	} else {
-		snprintf(config_file, sizeof(config_file), "%s", config_path);
+		len = snprintf(config_file, sizeof(config_file), "%s", config_path);
 	}
+	if (len < 0 || (size_t) len >= sizeof(config_file))
+		err("The configuration file path is too long.\n");
 
 	if (fifo_path != NULL) {
 		int fifo_fd = open(fifo_path, O_RDWR | O_NONBLOCK);
 		if (fifo_fd != -1) {
+			/* Don't leak the descriptor into the commands we spawn. */
+			fcntl(fifo_fd, F_SETFD, FD_CLOEXEC);
 			status_fifo = fdopen(fifo_fd, "w");
+			if (status_fifo == NULL) {
+				warn("Couldn't open status fifo.\n");
+				close(fifo_fd);
+			}
 		} else {
 			warn("Couldn't open status fifo.\n");
 		}
 	}
 
-	signal(SIGINT, hold);
-	signal(SIGHUP, hold);
-	signal(SIGTERM, hold);
-	signal(SIGUSR1, hold);
-	signal(SIGUSR2, hold);
-	signal(SIGALRM, hold);
+	install_signal_handlers();
 
 	setup();
 	get_standard_keysyms();
 	get_lock_fields();
 	abort_chord = make_chord(abort_keysym, XCB_NONE, 0, XCB_KEY_PRESS, false, false);
-	load_config(config_file);
+	if (!load_config(config_file))
+		exit(EXIT_FAILURE);
 	for (int i = 0; i < num_extra_confs; i++)
-		load_config(extra_confs[i]);
+		if (!load_config(extra_confs[i]))
+			exit(EXIT_FAILURE);
 	grab();
 
 	xcb_generic_event_t *evt;
@@ -154,58 +182,71 @@ int main(int argc, char *argv[])
 
 	fd_set descriptors;
 
-	reload = toggle_grab = bell = chained = locked = false;
-	running = true;
+	reload = toggle_grab = bell = 0;
+	chained = locked = false;
+	running = 1;
 
 	xcb_flush(dpy);
 
 	while (running) {
-		FD_ZERO(&descriptors);
-		FD_SET(fd, &descriptors);
-
-		if (select(fd + 1, &descriptors, NULL, NULL, NULL) > 0) {
-			while ((evt = xcb_poll_for_event(dpy)) != NULL) {
-				uint8_t event_type = XCB_EVENT_RESPONSE_TYPE(evt);
-				switch (event_type) {
-					case XCB_KEY_PRESS:
-					case XCB_KEY_RELEASE:
-					case XCB_BUTTON_PRESS:
-					case XCB_BUTTON_RELEASE:
-						key_button_event(evt, event_type);
-						break;
-					case XCB_MAPPING_NOTIFY:
-						mapping_notify(evt);
-						break;
-					default:
-						PRINTF("received event %u\n", event_type);
-						break;
-				}
-				free(evt);
+		/* Handle whatever is already queued: requests made while handling
+		 * events or reloading can pull events into xcb's queue without the
+		 * socket becoming readable again. */
+		while ((evt = xcb_poll_for_event(dpy)) != NULL) {
+			uint8_t event_type = XCB_EVENT_RESPONSE_TYPE(evt);
+			switch (event_type) {
+				case XCB_KEY_PRESS:
+				case XCB_KEY_RELEASE:
+				case XCB_BUTTON_PRESS:
+				case XCB_BUTTON_RELEASE:
+					key_button_event(evt, event_type);
+					break;
+				case XCB_MAPPING_NOTIFY:
+					mapping_notify(evt);
+					break;
+				default:
+					PRINTF("received event %u\n", event_type);
+					break;
 			}
-		}
-
-		if (reload) {
-			signal(SIGUSR1, hold);
-			reload_cmd();
-			reload = false;
-		}
-
-		if (toggle_grab) {
-			signal(SIGUSR2, hold);
-			toggle_grab_cmd();
-			toggle_grab = false;
-		}
-
-		if (bell) {
-			signal(SIGALRM, hold);
-			put_status(TIMEOUT_PREFIX, "Timeout reached");
-			abort_chain();
-			bell = false;
+			free(evt);
 		}
 
 		if (xcb_connection_has_error(dpy)) {
 			warn("The server closed the connection.\n");
-			running = false;
+			break;
+		}
+
+		if (reload) {
+			reload = 0;
+			reload_cmd();
+			continue;
+		}
+
+		if (toggle_grab) {
+			toggle_grab = 0;
+			toggle_grab_cmd();
+			continue;
+		}
+
+		if (bell) {
+			bell = 0;
+			put_status(TIMEOUT_PREFIX, "Timeout reached");
+			abort_chain();
+			continue;
+		}
+
+		if (!running)
+			break;
+
+		FD_ZERO(&descriptors);
+		FD_SET(fd, &descriptors);
+
+		/* The signals are blocked outside of this call, which atomically
+		 * unblocks them while waiting: a signal can't slip in between the
+		 * flag checks above and the wait and then go unnoticed. */
+		if (pselect(fd + 1, &descriptors, NULL, NULL, NULL, &orig_sigmask) == -1 && errno != EINTR) {
+			warn("pselect failed: %s.\n", strerror(errno));
+			break;
 		}
 	}
 
@@ -270,6 +311,7 @@ void mapping_notify(xcb_generic_event_t *evt)
 		return;
 	if (xcb_refresh_keyboard_mapping(symbols, e) == 1) {
 		destroy_chord(abort_chord);
+		abort_chord = NULL;
 		get_lock_fields();
 		reload_cmd();
 		abort_chord = make_chord(abort_keysym, XCB_NONE, 0, XCB_KEY_PRESS, false, false);
@@ -307,10 +349,8 @@ void setup(void)
 	setenv("SXHKD_PID", sxhkd_pid, 1);
 }
 
-void cleanup(void)
+static void free_hotkeys(hotkey_t *hk)
 {
-	PUTS("cleanup");
-	hotkey_t *hk = hotkeys_head;
 	while (hk != NULL) {
 		hotkey_t *next = hk->next;
 		destroy_chain(hk->chain);
@@ -318,16 +358,40 @@ void cleanup(void)
 		free(hk);
 		hk = next;
 	}
+}
+
+void cleanup(void)
+{
+	PUTS("cleanup");
+	free_hotkeys(hotkeys_head);
 	hotkeys_head = hotkeys_tail = NULL;
 }
 
 void reload_cmd(void)
 {
 	PUTS("reload");
-	cleanup();
-	load_config(config_file);
-	for (int i = 0; i < num_extra_confs; i++)
-		load_config(extra_confs[i]);
+	/* The chain state points into the hotkeys that are about to be freed. */
+	if (chained)
+		abort_chain();
+
+	/* Load into a fresh list so that the running configuration survives a
+	 * failed reload (e.g. a config file that was moved or is unreadable). */
+	hotkey_t *old_head = hotkeys_head;
+	hotkeys_head = hotkeys_tail = NULL;
+	bool ok = load_config(config_file);
+	for (int i = 0; ok && i < num_extra_confs; i++)
+		ok = load_config(extra_confs[i]);
+
+	if (!ok) {
+		warn("Reload failed, keeping the previous configuration.\n");
+		free_hotkeys(hotkeys_head);
+		hotkeys_head = old_head;
+		for (hotkeys_tail = old_head; hotkeys_tail != NULL && hotkeys_tail->next != NULL; hotkeys_tail = hotkeys_tail->next)
+			;
+		return;
+	}
+
+	free_hotkeys(old_head);
 	ungrab();
 	grab();
 }
@@ -345,13 +409,33 @@ void toggle_grab_cmd(void)
 void hold(int sig)
 {
 	if (sig == SIGHUP || sig == SIGINT || sig == SIGTERM)
-		running = false;
+		running = 0;
 	else if (sig == SIGUSR1)
-		reload = true;
+		reload = 1;
 	else if (sig == SIGUSR2)
-		toggle_grab = true;
+		toggle_grab = 1;
 	else if (sig == SIGALRM)
-		bell = true;
+		bell = 1;
+}
+
+static void install_signal_handlers(void)
+{
+	static const int sigs[] = {SIGINT, SIGHUP, SIGTERM, SIGUSR1, SIGUSR2, SIGALRM};
+	struct sigaction sa;
+	sigset_t blocked;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = hold;
+	sigemptyset(&sa.sa_mask);
+	sigemptyset(&blocked);
+	for (size_t i = 0; i < LENGTH(sigs); i++) {
+		sigaction(sigs[i], &sa, NULL);
+		sigaddset(&blocked, sigs[i]);
+	}
+	/* From here on the signals are only delivered while the event loop waits
+	 * (see pselect()); orig_sigmask is the mask to wait with and to restore
+	 * in spawned commands. */
+	sigprocmask(SIG_BLOCK, &blocked, &orig_sigmask);
 }
 
 void put_status(char c, const char *s)

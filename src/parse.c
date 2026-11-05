@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <inttypes.h>
 #include <ctype.h>
@@ -2374,17 +2375,20 @@ keysym_dict_t nks_dict[] = {/*{{{*/
 #endif
 };/*}}}*/
 
-void load_config(const char *config_file)
+bool load_config(const char *config_file)
 {
 	PRINTF("load configuration '%s'\n", config_file);
 	FILE *cfg = fopen(config_file, "r");
-	if (cfg == NULL)
-		err("Can't open configuration file: '%s'.\n", config_file);
+	if (cfg == NULL) {
+		warn("Can't open configuration file '%s': %s.\n", config_file, strerror(errno));
+		return false;
+	}
 
 	char buf[3 * MAXLEN];
 	char chain[MAXLEN] = {0};
 	char command[2 * MAXLEN] = {0};
-	int offset = 0;
+	size_t offset = 0;
+	bool truncated = false;
 	char first;
 
 	while (fgets(buf, sizeof(buf), cfg) != NULL) {
@@ -2398,19 +2402,34 @@ void load_config(const char *config_file)
 			char *end = rgraph(buf);
 			*(end + 1) = '\0';
 
-			if (isgraph(first))
-				snprintf(chain + offset, sizeof(chain) - offset, "%s", start);
-			else
-				snprintf(command + offset, sizeof(command) - offset, "%s", start);
+			bool is_chain = is_graphic(first);
+			char *dest = is_chain ? chain : command;
+			size_t size = is_chain ? sizeof(chain) : sizeof(command);
+
+			/* Continuation lines accumulate in the buffer: never let the
+			 * offset run past its end. */
+			if (offset >= size) {
+				offset = size - 1;
+				if (!truncated) {
+					warn("Line too long in '%s', truncating it.\n", config_file);
+					truncated = true;
+				}
+			}
+			if (strlen(start) >= size - offset && !truncated) {
+				warn("Line too long in '%s', truncating it.\n", config_file);
+				truncated = true;
+			}
+			snprintf(dest + offset, size - offset, "%s", start);
 
 			if (*end == PARTIAL_LINE) {
 				offset += end - start;
 				continue;
 			} else {
 				offset = 0;
+				truncated = false;
 			}
 
-			if (isspace(first) && strlen(chain) > 0 && strlen(command) > 0) {
+			if (!is_chain && strlen(chain) > 0 && strlen(command) > 0) {
 				process_hotkey(chain, command);
 				chain[0] = '\0';
 				command[0] = '\0';
@@ -2419,6 +2438,7 @@ void load_config(const char *config_file)
 	}
 
 	fclose(cfg);
+	return true;
 }
 
 void parse_event(xcb_generic_event_t *evt, uint8_t event_type, xcb_keysym_t *keysym, xcb_button_t *button, uint16_t *modfield)
@@ -2453,7 +2473,7 @@ void process_hotkey(char *hotkey_string, char *command_string)
 	char hotkey[2 * MAXLEN] = {0};
 	char command[2 * MAXLEN] = {0};
 	char last_hotkey[2 * MAXLEN] = {0};
-	unsigned char num_same = 0;
+	int num_same = 0;
 	chunk_t *hk_chunks = extract_chunks(hotkey_string);
 	chunk_t *cm_chunks = extract_chunks(command_string);
 
@@ -2596,7 +2616,6 @@ chunk_t *extract_chunks(char *s)
 	size_t len = strlen(s);
 	unsigned int i = 0, j = 0;
 	bool inhibit = false;
-	int num_seq = 0;
 	chunk_t *c = make_chunk();
 	chunk_t *head = c;
 	while (i < len) {
@@ -2619,8 +2638,6 @@ chunk_t *extract_chunks(char *s)
 			}
 			c->sequence = true;
 		} else if (s[i] == SEQ_END) {
-			if (c->sequence)
-				num_seq++;
 			if (j > 0) {
 				c->text[j] = '\0';
 				j = 0;
@@ -2640,7 +2657,7 @@ chunk_t *extract_chunks(char *s)
 
 chunk_t *make_chunk(void)
 {
-	chunk_t *c = calloc(1, sizeof(chunk_t));
+	chunk_t *c = ecalloc(1, sizeof(chunk_t));
 	c->sequence = false;
 	c->advance = NULL;
 	c->next = NULL;
@@ -2691,6 +2708,11 @@ bool parse_chain(char *string, chain_t *chain)
 		}
 		if (strstr(ignored, GRP_SEP) != NULL)
 			lock_chain = true;
+		if (keysym == XCB_NO_SYMBOL && button == XCB_NONE) {
+			/* Only modifiers: a zero keysym would match every unassigned keycode. */
+			warn("Missing keysym or button in '%s'.\n", chord);
+			return false;
+		}
 		if (button != XCB_NONE)
 			event_type = key_to_button(event_type);
 		chord_t *c = make_chord(keysym, button, modfield, event_type, replay_event, lock_chain);
@@ -2725,8 +2747,16 @@ bool parse_keysym(char *name, xcb_keysym_t *keysym)
 
 bool parse_button(char *name, xcb_button_t *butidx)
 {
-	/* X handles up to 24 buttons */
-	return (sscanf(name, "button%" SCNu8, butidx) == 1);
+	/* Button numbers fit in a CARD8 and start at 1; reject "button0",
+	 * "button300" and trailing garbage such as "button1x". */
+	if (strncmp(name, "button", 6) != 0 || !isdigit((unsigned char) name[6]))
+		return false;
+	char *end;
+	unsigned long n = strtoul(name + 6, &end, 10);
+	if (*end != '\0' || n < 1 || n > UINT8_MAX)
+		return false;
+	*butidx = (xcb_button_t) n;
+	return true;
 }
 
 bool parse_modifier(char *name, uint16_t *modfield)
@@ -2772,15 +2802,6 @@ bool parse_modifier(char *name, uint16_t *modfield)
 		return true;
 	} else if (strcmp(name, "any") == 0) {
 		*modfield |= XCB_MOD_MASK_ANY;
-		return true;
-	}
-	return false;
-}
-
-bool parse_fold(char *string, char *folded_string)
-{
-	if (strchr(string, SEQ_BEGIN) != NULL && strrchr(string, SEQ_END) != NULL) {
-		snprintf(folded_string, strlen(string), "%s", string);
 		return true;
 	}
 	return false;

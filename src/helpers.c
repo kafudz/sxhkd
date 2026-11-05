@@ -26,13 +26,14 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <unistd.h>
-#include <ctype.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include "sxhkd.h"
 
-void warn(char *fmt, ...)
+void warn(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -41,13 +42,29 @@ void warn(char *fmt, ...)
 }
 
 __attribute__((noreturn))
-void err(char *fmt, ...)
+void err(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
 	exit(EXIT_FAILURE);
+}
+
+void *emalloc(size_t size)
+{
+	void *p = malloc(size);
+	if (p == NULL)
+		err("Out of memory.\n");
+	return p;
+}
+
+void *ecalloc(size_t nmemb, size_t size)
+{
+	void *p = calloc(nmemb, size);
+	if (p == NULL)
+		err("Out of memory.\n");
+	return p;
 }
 
 void run(char *command, bool sync)
@@ -58,19 +75,29 @@ void run(char *command, bool sync)
 
 void spawn(char *cmd[], bool sync)
 {
-	if (fork() == 0) {
+	pid_t pid = fork();
+	if (pid == -1) {
+		warn("Failed to fork: %s.\n", strerror(errno));
+		return;
+	}
+	if (pid == 0) {
+		/* The daemon blocks its signals while it is not waiting for
+		 * events; the spawned command must not inherit that mask. */
+		sigprocmask(SIG_SETMASK, &orig_sigmask, NULL);
 		if (dpy != NULL)
 			close(xcb_get_file_descriptor(dpy));
 		if (sync) {
 			execute(cmd);
 		} else {
-			if (fork() == 0) {
+			pid_t pid2 = fork();
+			if (pid2 == 0)
 				execute(cmd);
-			}
-			exit(EXIT_SUCCESS);
+			/* _exit: don't flush stdio buffers inherited from the daemon */
+			_exit(pid2 == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
 		}
 	}
-	wait(NULL);
+	while (waitpid(pid, NULL, 0) == -1 && errno == EINTR)
+		;
 }
 
 void execute(char *cmd[])
@@ -82,14 +109,24 @@ void execute(char *cmd[])
 		close(redir_fd);
 	}
 	execvp(cmd[0], cmd);
-	err("Spawning failed.\n");
+	warn("Spawning '%s' failed: %s.\n", cmd[0], strerror(errno));
+	_exit(EXIT_FAILURE);
+}
+
+/* Locale-independent replacement for isgraph(): bytes >= 0x80 (UTF-8) count
+ * as graphic characters, whereas isgraph() rejects them in the "C" locale and
+ * would make the trimming below eat trailing non-ASCII characters. */
+bool is_graphic(char c)
+{
+	unsigned char u = (unsigned char) c;
+	return u > ' ' && u != 0x7f;
 }
 
 char *lgraph(char *s)
 {
 	size_t len = strlen(s);
-	unsigned int i = 0;
-	while (i < len && !isgraph(s[i]))
+	size_t i = 0;
+	while (i < len && !is_graphic(s[i]))
 		i++;
 	if (i < len)
 		return (s + i);
@@ -99,11 +136,11 @@ char *lgraph(char *s)
 
 char *rgraph(char *s)
 {
-	int i = strlen(s) - 1;
-	while (i >= 0 && !isgraph(s[i]))
-		i--;
-	if (i >= 0)
-		return (s + i);
+	size_t len = strlen(s);
+	while (len > 0 && !is_graphic(s[len - 1]))
+		len--;
+	if (len > 0)
+		return (s + len - 1);
 	else
 		return NULL;
 }

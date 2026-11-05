@@ -25,6 +25,9 @@
 #ifndef SXHKD_HELPERS_H
 #define SXHKD_HELPERS_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 #define LENGTH(x)         (sizeof(x) / sizeof(*x))
 #define MAXLEN            256
 
@@ -36,12 +39,17 @@
 #  define PRINTF(x,...)   ((void)0)
 #endif
 
-void warn(char *fmt, ...);
+__attribute__((format(printf, 1, 2)))
+void warn(const char *fmt, ...);
+__attribute__((noreturn, format(printf, 1, 2)))
+void err(const char *fmt, ...);
 __attribute__((noreturn))
-void err(char *fmt, ...);
 void execute(char *cmd[]);
 void spawn(char *cmd[], bool sync);
 void run(char *command, bool sync);
+void *emalloc(size_t size);
+void *ecalloc(size_t nmemb, size_t size);
+bool is_graphic(char c);
 char *lgraph(char *s);
 char *rgraph(char *s);
 

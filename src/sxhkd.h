@@ -27,6 +27,7 @@
 
 #include <xcb/xcb_keysyms.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdbool.h>
 #include "types.h"
 #include "helpers.h"
@@ -58,7 +59,12 @@ extern int mapping_count;
 extern int timeout;
 
 extern hotkey_t *hotkeys_head, *hotkeys_tail;
-extern bool running, grabbed, toggle_grab, reload, bell, chained, locked;
+/* Set from the signal handler, hence volatile sig_atomic_t. */
+extern volatile sig_atomic_t running, toggle_grab, reload, bell;
+extern bool grabbed, chained, locked;
+/* The original signal mask, i.e. with our signals unblocked: used while waiting
+ * for events and restored in spawned commands. */
+extern sigset_t orig_sigmask;
 extern xcb_keysym_t abort_keysym;
 extern chord_t *abort_chord;
 
