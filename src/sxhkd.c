@@ -35,6 +35,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include "parse.h"
@@ -95,14 +96,22 @@ int main(int argc, char *argv[])
 				printf(USAGE);
 				exit(EXIT_SUCCESS);
 				break;
-			case 'm':
-				if (sscanf(optarg, "%i", &mapping_count) != 1)
-					warn("Can't parse mapping count.\n");
+			case 'm': {
+				char *end;
+				errno = 0;
+				long m = strtol(optarg, &end, 10);
+				/* -1 means "handle every mapping notify event". */
+				if (end == optarg || *end != '\0' || errno == ERANGE || m < -1 || m > INT_MAX)
+					warn("Can't parse mapping count: %s.\n", optarg);
+				else
+					mapping_count = (int) m;
 				break;
+			}
 			case 't': {
 				char *end;
+				errno = 0;
 				long t = strtol(optarg, &end, 10);
-				if (end == optarg || *end != '\0')
+				if (end == optarg || *end != '\0' || errno == ERANGE || t < 0 || t > INT_MAX)
 					warn("Can't parse timeout: %s.\n", optarg);
 				else
 					timeout = (int) t;
@@ -112,7 +121,7 @@ int main(int argc, char *argv[])
 				config_path = optarg;
 				break;
 			case 'r':
-				redir_fd = open(optarg, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+				redir_fd = open(optarg, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 				if (redir_fd == -1) {
 					warn("Failed to open the command redirection file.\n");
 				} else if (redir_fd <= STDERR_FILENO) {
@@ -153,7 +162,7 @@ int main(int argc, char *argv[])
 			len = snprintf(config_file, sizeof(config_file), "%s/%s", config_home, CONFIG_PATH);
 		} else {
 			char *home = getenv("HOME");
-			if (home == NULL)
+			if (home == NULL || home[0] == '\0')
 				err("Neither '%s' nor 'HOME' is defined.\n", CONFIG_HOME_ENV);
 			len = snprintf(config_file, sizeof(config_file), "%s/%s/%s", home, ".config", CONFIG_PATH);
 		}
@@ -178,6 +187,13 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* Initialise the flags before installing the handlers: a signal that
+	 * arrives in the small window before the signals are blocked must not be
+	 * overwritten by a later reset. */
+	running = 1;
+	reload = toggle_grab = bell = 0;
+	chained = locked = false;
+
 	install_signal_handlers();
 
 	setup();
@@ -189,16 +205,13 @@ int main(int argc, char *argv[])
 	for (int i = 0; i < num_extra_confs; i++)
 		if (!load_config(extra_confs[i]))
 			exit(EXIT_FAILURE);
-	grab();
+	if (running)
+		grab();
 
 	xcb_generic_event_t *evt;
 	int fd = xcb_get_file_descriptor(dpy);
 
 	fd_set descriptors;
-
-	reload = toggle_grab = bell = 0;
-	chained = locked = false;
-	running = 1;
 
 	xcb_flush(dpy);
 
@@ -242,6 +255,11 @@ int main(int argc, char *argv[])
 			break;
 		}
 
+		/* Don't reload or toggle when a termination request is already
+		 * pending: the next iteration would exit anyway. */
+		if (!running)
+			break;
+
 		if (reload) {
 			reload = 0;
 			reload_cmd();
@@ -256,13 +274,12 @@ int main(int argc, char *argv[])
 
 		if (bell) {
 			bell = 0;
-			put_status(TIMEOUT_PREFIX, "Timeout reached");
-			abort_chain();
+			if (chained) {
+				put_status(TIMEOUT_PREFIX, "Timeout reached");
+				abort_chain();
+			}
 			continue;
 		}
-
-		if (!running)
-			break;
 
 		FD_ZERO(&descriptors);
 		FD_SET(fd, &descriptors);
@@ -478,6 +495,9 @@ void put_status(char c, const char *s)
 	if (status_fifo == NULL) {
 		return;
 	}
-	fprintf(status_fifo, "%c%s\n", c, s);
-	fflush(status_fifo);
+	if (fprintf(status_fifo, "%c%s\n", c, s) < 0 || fflush(status_fifo) == EOF) {
+		/* A full non-blocking FIFO or a vanished reader sets the stream's
+		 * error flag; without clearing it every later update would fail. */
+		clearerr(status_fifo);
+	}
 }

@@ -2404,7 +2404,9 @@ bool load_config(const char *config_file)
 		}
 
 		first = buf[0];
-		if (strlen(buf) < 2 || first == START_COMMENT) {
+		/* Don't use strlen(buf) < 2 here: a one-character final line
+		 * without a trailing newline is still a valid hotkey. */
+		if (buf[0] == '\0' || first == START_COMMENT) {
 			continue;
 		} else {
 			char *start = lgraph(buf);
@@ -2465,6 +2467,13 @@ bool load_config(const char *config_file)
 		}
 	}
 
+	if (ferror(cfg)) {
+		warn("Error while reading configuration file '%s'.\n", config_file);
+		fclose(cfg);
+		return false;
+	}
+	if (partial)
+		warn("Unterminated line continuation in '%s'.\n", config_file);
 	fclose(cfg);
 	return true;
 }
@@ -2733,6 +2742,8 @@ bool parse_chain(char *string, chain_t *chain)
 	char *outer_advance;
 	char *inner_advance;
 	for (outer_advance = get_token(chord, ignored, string, LNK_SEP); chord[0] != '\0'; outer_advance = get_token(chord, ignored, outer_advance, LNK_SEP)) {
+		bool have_keysym = false;
+		bool have_button = false;
 		for (inner_advance = get_token(name, NULL, chord, SYM_SEP); name[0] != '\0'; inner_advance = get_token(name, NULL, inner_advance, SYM_SEP)) {
 			int offset = 0;
 			if (name[offset] == REPLAY_PREFIX) {
@@ -2744,7 +2755,27 @@ bool parse_chain(char *string, chain_t *chain)
 				offset++;
 			}
 			char *nm = name + offset;
-			if (!parse_modifier(nm, &modfield) && !parse_keysym(nm, &keysym) && !parse_button(nm, &button)) {
+			if (parse_modifier(nm, &modfield)) {
+				/* "any" means "ignore all modifiers"; OR-ing it with an
+				 * explicit modifier produces a modfield that can never be
+				 * matched (and grabs a bogus combination). */
+				if ((modfield & XCB_MOD_MASK_ANY) && modfield != XCB_MOD_MASK_ANY) {
+					warn("The 'any' modifier can't be combined with other modifiers in '%s'.\n", chord);
+					return false;
+				}
+			} else if (parse_keysym(nm, &keysym)) {
+				if (have_keysym || have_button) {
+					warn("Multiple keysyms or buttons in '%s'.\n", chord);
+					return false;
+				}
+				have_keysym = true;
+			} else if (parse_button(nm, &button)) {
+				if (have_button || have_keysym) {
+					warn("Multiple keysyms or buttons in '%s'.\n", chord);
+					return false;
+				}
+				have_button = true;
+			} else {
 				warn("Unknown keysym name: '%s'.\n", nm);
 				return false;
 			}
@@ -2782,6 +2813,17 @@ bool parse_chain(char *string, chain_t *chain)
 		 * grab or match, and later code assumes every chain has a chord. */
 		warn("Empty hotkey in '%s'.\n", string);
 		return false;
+	}
+	/* ':' means "don't abort the chain when its tail is reached", so it only
+	 * makes sense on the separator between the last two chords.  A colon
+	 * earlier in the chain would lock it while it is still in the middle and
+	 * make the remaining chords unreachable, and a trailing colon would be
+	 * ignored because the tail is what triggers the abort. */
+	for (chord_t *c = chain->head; c != NULL; c = c->next) {
+		if (c->lock_chain && (c->next == NULL || c->next->next != NULL)) {
+			warn("The ':' separator can only appear between the last two chords in '%s'.\n", string);
+			return false;
+		}
 	}
 	return true;
 }

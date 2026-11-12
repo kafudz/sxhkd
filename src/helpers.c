@@ -101,8 +101,13 @@ void spawn(char *cmd[], bool sync)
 	 * them while waiting so a synchronous command can be interrupted by a
 	 * termination request instead of delaying it until the command ends. */
 	sigprocmask(SIG_SETMASK, &orig_sigmask, &saved);
-	while (waitpid(pid, NULL, 0) == -1 && errno == EINTR && running)
-		;
+	while (waitpid(pid, NULL, 0) == -1) {
+		if (errno == EINTR && running)
+			continue;
+		if (errno != EINTR)
+			warn("Failed to wait for child process: %s.\n", strerror(errno));
+		break;
+	}
 	sigprocmask(SIG_SETMASK, &saved, NULL);
 }
 

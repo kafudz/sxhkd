@@ -146,7 +146,12 @@ chord_t *make_chord(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield,
 					xcb_keysym_t ks = xcb_key_symbols_get_keysym(symbols, *kc, col);
 					if (ks == keysym) {
 						uint16_t implicit_modfield = (col & 1 ? XCB_MOD_MASK_SHIFT : 0) | (col & 2 ? XCB_MOD_MASK_5 : 0);
-						uint16_t explicit_modfield = modfield | implicit_modfield;
+						/* "any" already matches every modifier state; adding the
+						 * implicit shift/mode-switch bits would make the chord
+						 * impossible to match. */
+						uint16_t explicit_modfield = (modfield & XCB_MOD_MASK_ANY)
+						                             ? XCB_MOD_MASK_ANY
+						                             : modfield | implicit_modfield;
 						chord = ecalloc(1, sizeof(chord_t));
 						bool unique = true;
 						for (chord_t *c = orig; unique && c != NULL; c = c->more)
@@ -182,7 +187,7 @@ chord_t *make_chord(xcb_keysym_t keysym, xcb_button_t button, uint16_t modfield,
 		chord = ecalloc(1, sizeof(chord_t));
 		chord->keysym = keysym;
 		chord->button = button;
-		chord->modfield = modfield;
+		chord->modfield = (modfield & XCB_MOD_MASK_ANY) ? XCB_MOD_MASK_ANY : modfield;
 		chord->event_type = event_type;
 		chord->replay_event = replay_event;
 		chord->lock_chain = lock_chain;
