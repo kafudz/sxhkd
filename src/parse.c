@@ -2389,9 +2389,20 @@ bool load_config(const char *config_file)
 	char command[2 * MAXLEN] = {0};
 	size_t offset = 0;
 	bool truncated = false;
+	bool partial = false;
+	bool partial_chain = false;
 	char first;
 
 	while (fgets(buf, sizeof(buf), cfg) != NULL) {
+		/* fgets() splits physical lines that don't fit in buf; the tail
+		 * would otherwise be mistaken for another hotkey or command. */
+		bool overlong = strchr(buf, '\n') == NULL && !feof(cfg);
+		if (overlong) {
+			int c;
+			while ((c = fgetc(cfg)) != '\n' && c != EOF)
+				;
+		}
+
 		first = buf[0];
 		if (strlen(buf) < 2 || first == START_COMMENT) {
 			continue;
@@ -2402,31 +2413,48 @@ bool load_config(const char *config_file)
 			char *end = rgraph(buf);
 			*(end + 1) = '\0';
 
-			bool is_chain = is_graphic(first);
+			if (overlong && !truncated) {
+				warn("Line too long in '%s', truncating it.\n", config_file);
+				truncated = true;
+			}
+
+			/* A continuation line belongs to the buffer the previous
+			 * partial line started, no matter how this line is indented.
+			 * Classifying it by its own first character would send an
+			 * unindented command continuation to the hotkey buffer. */
+			bool is_chain = partial ? partial_chain : is_graphic(first);
 			char *dest = is_chain ? chain : command;
 			size_t size = is_chain ? sizeof(chain) : sizeof(command);
 
 			/* Continuation lines accumulate in the buffer: never let the
 			 * offset run past its end. */
-			if (offset >= size) {
-				offset = size - 1;
-				if (!truncated) {
+			size_t avail = size - offset;
+			if (avail > 1) {
+				if (strlen(start) >= avail && !truncated) {
 					warn("Line too long in '%s', truncating it.\n", config_file);
 					truncated = true;
 				}
-			}
-			if (strlen(start) >= size - offset && !truncated) {
+				snprintf(dest + offset, avail, "%s", start);
+			} else if (!truncated) {
 				warn("Line too long in '%s', truncating it.\n", config_file);
 				truncated = true;
 			}
-			snprintf(dest + offset, size - offset, "%s", start);
 
-			if (*end == PARTIAL_LINE) {
-				offset += end - start;
+			if (!overlong && *end == PARTIAL_LINE) {
+				/* The next line overwrites the trailing backslash. */
+				size_t written = strlen(dest + offset);
+				offset += written;
+				if (written > 0 && dest[offset - 1] == PARTIAL_LINE)
+					offset--;
+				if (offset >= size)
+					offset = size - 1;
+				partial = true;
+				partial_chain = is_chain;
 				continue;
 			} else {
 				offset = 0;
 				truncated = false;
+				partial = false;
 			}
 
 			if (!is_chain && strlen(chain) > 0 && strlen(command) > 0) {
@@ -2473,7 +2501,16 @@ void process_hotkey(char *hotkey_string, char *command_string)
 	char hotkey[2 * MAXLEN] = {0};
 	char command[2 * MAXLEN] = {0};
 	char last_hotkey[2 * MAXLEN] = {0};
-	int num_same = 0;
+	bool have_last = false;
+	int run_len = 0;
+
+	/* extract_chunks()/render_next() size their output from the input and
+	 * use fixed 2 * MAXLEN buffers; refuse anything that wouldn't fit. */
+	if (strlen(hotkey_string) >= sizeof(hotkey) || strlen(command_string) >= sizeof(command)) {
+		warn("Hotkey definition too long, ignoring it.\n");
+		return;
+	}
+
 	chunk_t *hk_chunks = extract_chunks(hotkey_string);
 	chunk_t *cm_chunks = extract_chunks(command_string);
 
@@ -2502,8 +2539,16 @@ void process_hotkey(char *hotkey_string, char *command_string)
 				}
 			}
 			add_hotkey(hk);
-			if (strcmp(hotkey, last_hotkey) == 0)
-				num_same++;
+			/* Track the trailing run of identical hotkeys. Only those
+			 * should cycle: applying a cycle to a hotkey that has a
+			 * different or no predecessor makes its first press a no-op. */
+			if (have_last && strcmp(hotkey, last_hotkey) == 0) {
+				run_len++;
+			} else {
+				run_len = 1;
+			}
+			snprintf(last_hotkey, sizeof(last_hotkey), "%s", hotkey);
+			have_last = true;
 		} else {
 			destroy_chain(chain);
 		}
@@ -2511,15 +2556,13 @@ void process_hotkey(char *hotkey_string, char *command_string)
 		if (hk_chunks == NULL && cm_chunks == NULL)
 			break;
 
-		snprintf(last_hotkey, sizeof(last_hotkey), "%s", hotkey);
-
 		render_next(hk_chunks, hotkey);
 		render_next(cm_chunks, command);
 	}
 
-	if (num_same > 0) {
-		int period = num_same + 1;
-		int delay = num_same;
+	if (run_len > 1) {
+		int period = run_len;
+		int delay = run_len - 1;
 		for (hotkey_t *hk = hotkeys_tail; hk != NULL && delay >= 0; hk = hk->prev, delay--)
 			hk->cycle = make_cycle(delay, period);
 	}
@@ -2678,9 +2721,9 @@ void destroy_chunks(chunk_t *chunk)
 
 bool parse_chain(char *string, chain_t *chain)
 {
-	char chord[MAXLEN] = {0};
-	char name[MAXLEN] = {0};
-	char ignored[MAXLEN] = {0};
+	char chord[2 * MAXLEN] = {0};
+	char name[2 * MAXLEN] = {0};
+	char ignored[2 * MAXLEN] = {0};
 	xcb_keysym_t keysym = XCB_NO_SYMBOL;
 	xcb_button_t button = XCB_NONE;
 	uint16_t modfield = 0;
@@ -2721,7 +2764,11 @@ bool parse_chain(char *string, chain_t *chain)
 		}
 		add_chord(chain, c);
 		if (status_fifo != NULL) {
-			snprintf(c->repr, sizeof(c->repr), "%s", chord);
+			size_t repr_len = strlen(chord);
+			if (repr_len >= sizeof(c->repr))
+				repr_len = sizeof(c->repr) - 1;
+			memcpy(c->repr, chord, repr_len);
+			c->repr[repr_len] = '\0';
 		}
 		keysym = XCB_NO_SYMBOL;
 		button = XCB_NONE;
@@ -2729,6 +2776,12 @@ bool parse_chain(char *string, chain_t *chain)
 		event_type = XCB_KEY_PRESS;
 		replay_event = false;
 		lock_chain = false;
+	}
+	if (chain->head == NULL) {
+		/* e.g. a hotkey made only of separators (":"): there is nothing to
+		 * grab or match, and later code assumes every chain has a chord. */
+		warn("Empty hotkey in '%s'.\n", string);
+		return false;
 	}
 	return true;
 }

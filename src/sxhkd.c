@@ -32,6 +32,7 @@
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <time.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
@@ -112,8 +113,21 @@ int main(int argc, char *argv[])
 				break;
 			case 'r':
 				redir_fd = open(optarg, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-				if (redir_fd == -1)
+				if (redir_fd == -1) {
 					warn("Failed to open the command redirection file.\n");
+				} else if (redir_fd <= STDERR_FILENO) {
+					/* Keep the descriptor away from the standard ones so
+					 * that execute() doesn't close a redirected stream. */
+					int fd = fcntl(redir_fd, F_DUPFD, STDERR_FILENO + 1);
+					if (fd == -1) {
+						warn("Failed to duplicate the command redirection descriptor: %s.\n", strerror(errno));
+						close(redir_fd);
+						redir_fd = -1;
+					} else {
+						close(redir_fd);
+						redir_fd = fd;
+					}
+				}
 				break;
 			case 's':
 				fifo_path = optarg;
@@ -192,6 +206,7 @@ int main(int argc, char *argv[])
 		/* Handle whatever is already queued: requests made while handling
 		 * events or reloading can pull events into xcb's queue without the
 		 * socket becoming readable again. */
+		int drained = 0;
 		while ((evt = xcb_poll_for_event(dpy)) != NULL) {
 			uint8_t event_type = XCB_EVENT_RESPONSE_TYPE(evt);
 			switch (event_type) {
@@ -209,6 +224,17 @@ int main(int argc, char *argv[])
 					break;
 			}
 			free(evt);
+
+			/* Signals are blocked except in pselect(). Under a continuous
+			 * stream of events, give them a chance to be delivered instead
+			 * of starving reload/termination requests. */
+			if (++drained >= 64) {
+				struct timespec zero = {0, 0};
+				drained = 0;
+				pselect(0, NULL, NULL, NULL, &zero, &orig_sigmask);
+				if (reload || toggle_grab || bell || !running)
+					break;
+			}
 		}
 
 		if (xcb_connection_has_error(dpy)) {
@@ -339,9 +365,12 @@ void setup(void)
 	if (screen == NULL)
 		err("Can't acquire screen.\n");
 	root = screen->root;
-	if ((shell = getenv(SXHKD_SHELL_ENV)) == NULL && (shell = getenv(SHELL_ENV)) == NULL)
-		err("The '%s' environment variable is not defined.\n", SHELL_ENV);
+	if ((shell = getenv(SXHKD_SHELL_ENV)) == NULL || shell[0] == '\0')
+		if ((shell = getenv(SHELL_ENV)) == NULL || shell[0] == '\0')
+			err("The '%s' environment variable is not defined.\n", SHELL_ENV);
 	symbols = xcb_key_symbols_alloc(dpy);
+	if (symbols == NULL)
+		err("Can't allocate key symbols.\n");
 	hotkeys_head = hotkeys_tail = NULL;
 	progress[0] = '\0';
 
@@ -392,8 +421,11 @@ void reload_cmd(void)
 	}
 
 	free_hotkeys(old_head);
-	ungrab();
-	grab();
+	/* Keep the grabbing state the user selected with SIGUSR2. */
+	if (grabbed) {
+		ungrab();
+		grab();
+	}
 }
 
 void toggle_grab_cmd(void)
@@ -401,6 +433,9 @@ void toggle_grab_cmd(void)
 	PUTS("toggle grab");
 	if (grabbed) {
 		ungrab();
+		/* The chain state refers to grabs that no longer exist. */
+		if (chained)
+			abort_chain();
 	} else {
 		grab();
 	}

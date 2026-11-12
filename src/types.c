@@ -248,15 +248,19 @@ void add_hotkey(hotkey_t *hk)
 void abort_chain(void)
 {
 	PUTS("abort chain");
-	put_status(END_CHAIN_PREFIX, "End chain");
+	if (chained)
+		put_status(END_CHAIN_PREFIX, "End chain");
 	for (hotkey_t *hk = hotkeys_head; hk != NULL; hk = hk->next)
 		hk->chain->state = hk->chain->head;
 	chained = false;
 	locked = false;
 	if (timeout > 0)
 		alarm(0);
-	ungrab();
-	grab();
+	/* Never re-enable grabbing: the grabs may have been toggled off. */
+	if (grabbed) {
+		ungrab();
+		grab();
+	}
 }
 
 void destroy_chain(chain_t *chain)
